@@ -1,4 +1,5 @@
 import torch
+import onnx
 from typing import List
 from itertools import chain
 
@@ -12,27 +13,18 @@ class MyPhi2(MixFormerSequentialForCausalLM):
     def __init__(self, config):
         super().__init__(config)
 
-    # @staticmethod
-    # def post_process(result, num_layer):
-    #     if isinstance(result[1][0], (tuple, list)):
-    #         assert len(result[1]) == num_layer and len(result[1][0]) == 2
-    #         # assert len(result[1][0][0].shape) == 4 and result[1][0][0].shape == result[1][0][1].shape
-    #         present = []
-    #         for i in range(num_layer):
-    #             # Since transformers v4.*, past key and values are separated outputs.
-    #             # Here we concate them into one tensor to be compatible with Attention operator.
-    #             present.append(
-    #                 torch.cat(
-    #                     (result[1][i][0].unsqueeze(0), result[1][i][1].unsqueeze(0)),
-    #                     dim=0,
-    #                 )
-    #             )
-    #         return (result[0], tuple(present))
+    @staticmethod
+    def post_process(result, num_layer):
+        present = []
+        for i in range(num_layer):
+            present.append(
+                result.past_key_values.key_value_memory_dict[i]
+            )
+        return (result.logits, tuple(present))
 
     def forward(self, input_ids, attention_mask, *past_key_values):
         kv_mem_dict = {}
         for i, kv in enumerate(past_key_values[0]):
-            print(i, kv.shape)
             kv_mem_dict[i] = kv
 
         inference_params = InferenceParams(
@@ -50,7 +42,7 @@ class MyPhi2(MixFormerSequentialForCausalLM):
             past_key_values=inference_params,
         )
 
-        return result
+        return MyPhi2.post_process(result, self.config.num_hidden_layers)
 
 
 def get_merged_model_dynamic_axes(input_names: List[str], output_names: List[str]):
@@ -113,39 +105,46 @@ decoder_merged_inputs = get_merged_sample_with_past_kv_inputs(
     world_size=1,
 )
 
-input_names = [
-    "input_ids",
-    "attention_mask",
-    *list(
-        chain.from_iterable(
-            (f"past_key_values.{i}",) for i in range(config.num_hidden_layers)
-        )
-    ),
-]
-output_names = [
-    "logits",
-    *list(
-        chain.from_iterable((f"present_key_values.{i}",) for i in range(config.num_hidden_layers))
-    ),
-]
-dynamic_axes = get_merged_model_dynamic_axes(input_names, output_names)
+# torch pass
+decoder_out = model(decoder_merged_inputs[0], decoder_merged_inputs[1], decoder_merged_inputs[2])
 
-    # Avoid using system temp dir to avoid overflood on hard disk as 70b model is very large.
-    # Use temp folder per rank to avoid race condition here.
-torch.onnx.export(
-    model,
-    args=decoder_merged_inputs,
-    f="phi2.onnx",
-    export_params=True,
-    input_names=input_names,
-    output_names=output_names,
-    dynamic_axes=dynamic_axes,
-    opset_version=13,
-    do_constant_folding=True,
-    verbose=True,
-)
+use_dynamo = True
 
-
-
-
-
+if use_dynamo:
+    from torch._dynamo import config
+    config.capture_scalar_outputs = True
+    temp_path = "phi-2_decoder.onnx"
+    torch.onnx.dynamo_export(
+        model, decoder_merged_inputs[0], decoder_merged_inputs[1], decoder_merged_inputs[2], export_options=torch.onnx.ExportOptions(dynamic_shapes=True)
+    ).save(temp_path)
+    onnx.checker.check_model(temp_path)
+    onnx.shape_inference.infer_shapes_path(temp_path)
+else:
+    input_names = [
+        "input_ids",
+        "attention_mask",
+        *list(
+            chain.from_iterable(
+                (f"past_key_values.{i}",) for i in range(config.num_hidden_layers)
+            )
+        ),
+    ]
+    output_names = [
+        "logits",
+        *list(
+            chain.from_iterable((f"present_key_values.{i}",) for i in range(config.num_hidden_layers))
+        ),
+    ]
+    dynamic_axes = get_merged_model_dynamic_axes(input_names, output_names)
+    torch.onnx.export(
+        model,
+        args=decoder_merged_inputs,
+        f="phi2.onnx",
+        export_params=True,
+        input_names=input_names,
+        output_names=output_names,
+        dynamic_axes=dynamic_axes,
+        opset_version=13,
+        do_constant_folding=True,
+        verbose=True,
+    )
