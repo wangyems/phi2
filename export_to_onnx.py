@@ -89,7 +89,7 @@ model.eval()
 # text = tokenizer.batch_decode(outputs)[0]
 # print(text)
 
-batch_size, sequence_length, past_sequence_length = 2, 8, 0
+batch_size, sequence_length, past_sequence_length = 2, 4096, 0
 
 max_sequence_length = 2048
 
@@ -110,55 +110,65 @@ decoder_out = model(decoder_merged_inputs[0], decoder_merged_inputs[1], decoder_
 
 
 # ort run
-from onnxruntime import InferenceSession, SessionOptions
-import numpy as np
-sess_options = SessionOptions()
-model_path = "/wy/onnx_models/phi2/mlflow_model_folder/data/phi-2_decoder_small_opt.onnx"
-ort_session = InferenceSession(model_path, sess_options, providers=["CUDAExecutionProvider"])
-# convert decoder_merged_inputs to ort_inputs
-ort_inputs = {}
-for i, name in enumerate(ort_session.get_inputs()):
-    ort_inputs[name.name] = decoder_merged_inputs[i].cpu().numpy()
-ort_outs = ort_session.run(None, ort_inputs)
+if False:
+    from onnxruntime import InferenceSession, SessionOptions
+    import numpy as np
+    sess_options = SessionOptions()
+    model_path = "/wy/onnx_models/phi2/mlflow_model_folder/data/phi-2_decoder_small_opt.onnx"
+    ort_session = InferenceSession(model_path, sess_options, providers=["CUDAExecutionProvider"])
+    # convert decoder_merged_inputs to ort_inputs
+    ort_inputs = {}
+    for i, name in enumerate(ort_session.get_inputs()):
+        if i == 0:
+            ort_inputs[name.name] = decoder_merged_inputs[i].cpu().numpy()
+            print(ort_inputs[name.name].shape)
+        elif i == 1:
+            ort_inputs[name.name] = np.ones([2, 2048]).astype(np.int64)
+            print(ort_inputs[name.name].shape)
+        else:
+            ort_inputs[name.name] = np.transpose(decoder_merged_inputs[2][i - 2].detach().cpu().numpy(), (2, 0, 3, 1, 4))
+            print(ort_inputs[name.name].shape)
+    ort_outs = ort_session.run(None, ort_inputs)
 
-# use_dynamo = True
+use_dynamo = True
 
-# if use_dynamo:
-#     from torch._dynamo import config
-#     config.capture_scalar_outputs = True
-#     temp_path = "phi-2_decoder_small.onnx"
-#     torch.onnx.dynamo_export(
-#         model, decoder_merged_inputs[0], decoder_merged_inputs[1], decoder_merged_inputs[2], export_options=torch.onnx.ExportOptions(dynamic_shapes=True)
-#     ).save(temp_path)
-#     onnx.checker.check_model(temp_path)
-#     onnx.shape_inference.infer_shapes_path(temp_path)
-# else:
-#     input_names = [
-#         "input_ids",
-#         "attention_mask",
-#         *list(
-#             chain.from_iterable(
-#                 (f"past_key_values.{i}",) for i in range(config.num_hidden_layers)
-#             )
-#         ),
-#     ]
-#     output_names = [
-#         "logits",
-#         *list(
-#             chain.from_iterable((f"present_key_values.{i}",) for i in range(config.num_hidden_layers))
-#         ),
-#     ]
-#     dynamic_axes = get_merged_model_dynamic_axes(input_names, output_names)
-#     print(dynamic_axes)
-#     torch.onnx.export(
-#         model,
-#         args=decoder_merged_inputs,
-#         f="phi2-jit.onnx",
-#         export_params=True,
-#         input_names=input_names,
-#         output_names=output_names,
-#         dynamic_axes=dynamic_axes,
-#         opset_version=17,
-#         do_constant_folding=True,
-#         verbose=True,
-#     )
+if True:
+    if use_dynamo:
+        from torch._dynamo import config
+        config.capture_scalar_outputs = True
+        temp_path = "phi-2_decoder_small.onnx"
+        torch.onnx.dynamo_export(
+            model, decoder_merged_inputs[0], decoder_merged_inputs[1], decoder_merged_inputs[2], export_options=torch.onnx.ExportOptions(dynamic_shapes=True)
+        ).save(temp_path)
+        onnx.checker.check_model(temp_path)
+        onnx.shape_inference.infer_shapes_path(temp_path)
+    else:
+        input_names = [
+            "input_ids",
+            "attention_mask",
+            *list(
+                chain.from_iterable(
+                    (f"past_key_values.{i}",) for i in range(config.num_hidden_layers)
+                )
+            ),
+        ]
+        output_names = [
+            "logits",
+            *list(
+                chain.from_iterable((f"present_key_values.{i}",) for i in range(config.num_hidden_layers))
+            ),
+        ]
+        dynamic_axes = get_merged_model_dynamic_axes(input_names, output_names)
+        print(dynamic_axes)
+        torch.onnx.export(
+            model,
+            args=decoder_merged_inputs,
+            f="phi2-jit.onnx",
+            export_params=True,
+            input_names=input_names,
+            output_names=output_names,
+            dynamic_axes=dynamic_axes,
+            opset_version=17,
+            do_constant_folding=True,
+            verbose=True,
+        )
