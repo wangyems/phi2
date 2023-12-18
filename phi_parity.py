@@ -142,6 +142,8 @@ def create_block_graph(
         [
             helper.make_tensor_value_info("o_hidden_states", TensorProto.FLOAT, ['batch_size', 'seq_len', hidden_size]),
             helper.make_tensor_value_info("o_kv_cache", TensorProto.FLOAT, [2, 'batch_size', num_heads, 'total_seq_len', head_size]),
+            helper.make_tensor_value_info("ln_out", TensorProto.FLOAT, ['batch_size', 'seq_len', hidden_size]),
+            helper.make_tensor_value_info("attn_out", TensorProto.FLOAT, ['batch_size', 'seq_len', hidden_size]),
         ],
         initializers,
     )
@@ -175,8 +177,10 @@ class ParallelBlock(nn.Module):
             80, # head_size
             self.ln.weight,
             self.ln.bias,
-            self.mixer.Wqkv.weight.reshape(config.n_head, 3, -1).transpose(0, 1).reshape(3 * config.n_embd, -1).transpose(0, 1),
-            self.mixer.Wqkv.bias.reshape(config.n_head, 3, -1).transpose(0, 1).reshape(-1),
+            #self.mixer.Wqkv.weight.reshape(config.n_head, 3, -1).transpose(0, 1).reshape(3 * config.n_embd, -1).transpose(0, 1),
+            #self.mixer.Wqkv.bias.reshape(config.n_head, 3, -1).transpose(0, 1).reshape(-1),
+            self.mixer.Wqkv.weight.transpose(0, 1),
+            self.mixer.Wqkv.bias,
             self.mixer.out_proj.weight.transpose(0, 1),
             self.mixer.out_proj.bias,
             self.mlp.fc1.weight.transpose(0, 1),
@@ -213,7 +217,7 @@ class ParallelBlock(nn.Module):
         past_key_values: Optional[Union[torch.FloatTensor, InferenceParams]] = None,
         attention_mask: Optional[torch.BoolTensor] = None,
         **kwargs,
-    ) -> torch.FloatTensor:
+    ):
         batch_size, seq_len, _ = hidden_states.shape
         ort_inputs = {
             "i_hidden_states": hidden_states.cpu().numpy(),
@@ -223,7 +227,7 @@ class ParallelBlock(nn.Module):
 
         ort_outs = self.ort_session.run(None, ort_inputs)
 
-        return torch.from_numpy(ort_outs[0])
+        return ort_outs
 
 
 config = MixFormerSequentialConfig.from_json_file("model/config.json")
@@ -231,13 +235,13 @@ config = MixFormerSequentialConfig.from_json_file("model/config.json")
 block = ParallelBlock(config, block_idx=0)
 block.eval()
 
-batch_size = 2
+batch_size = 1
 seq_len = 8
 
 kv_mem_dict = {}
-kv_mem_dict[0] = torch.zeros([batch_size, 2048, 2, config.n_head, 80])
+kv_mem_dict[0] = torch.zeros([batch_size, 128, 2, config.n_head, 80])
 inference_params = InferenceParams(
-    max_seqlen=config.n_positions,
+    max_seqlen=128, #config.n_positions,
     max_batch_size=batch_size,
     seqlen_offset=0,
     batch_size_offset=0,
@@ -245,7 +249,7 @@ inference_params = InferenceParams(
     lengths_per_sample=None,
 )
 
-hidden_states = torch.ones([batch_size, seq_len, config.n_embd])
+hidden_states = torch.randn([batch_size, seq_len, config.n_embd])
 attention_mask = torch.ones([batch_size, seq_len])
 
 torch_out = block(
@@ -260,5 +264,7 @@ ort_out = block.ort_forward(
     attention_mask=attention_mask,
 )
 
-print(torch_out)
-print(ort_out)
+print("torch: output:", torch_out)
+# print("ort: ln_out", torch.tensor(ort_out[2]))
+# print("ort: attn_out", torch.tensor(ort_out[3]))
+print("ort: output", torch.tensor(ort_out[0]))
