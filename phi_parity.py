@@ -172,13 +172,13 @@ class ParallelBlock(nn.Module):
 
         self.onnx_graph = create_block_graph(
             config.n_head,
-            config.head_size,
-            self.ln.weight.transpose(0, 1),
+            80, # head_size
+            self.ln.weight,
             self.ln.bias,
-            self.mixer.attn.qkv.weight.reshape(config.n_head, 3, -1).transpose(0, 1).reshape(3 * config.n_embd, -1).transpose(0, 1),
-            self.mixer.attn.qkv.bias,
-            self.mixer.attn.out_proj.weight.transpose(0, 1),
-            self.mixer.attn.out_proj.biasreshape(config.n_head, 3, -1).transpose(0, 1).reshape(-1),
+            self.mixer.Wqkv.weight.reshape(config.n_head, 3, -1).transpose(0, 1).reshape(3 * config.n_embd, -1).transpose(0, 1),
+            self.mixer.Wqkv.bias.reshape(config.n_head, 3, -1).transpose(0, 1).reshape(-1),
+            self.mixer.out_proj.weight.transpose(0, 1),
+            self.mixer.out_proj.bias,
             self.mlp.fc1.weight.transpose(0, 1),
             self.mlp.fc1.bias,
             self.mlp.fc2.weight.transpose(0, 1),
@@ -214,10 +214,11 @@ class ParallelBlock(nn.Module):
         attention_mask: Optional[torch.BoolTensor] = None,
         **kwargs,
     ) -> torch.FloatTensor:
+        batch_size, seq_len, _ = hidden_states.shape
         ort_inputs = {
             "i_hidden_states": hidden_states.cpu().numpy(),
-            "i_attn_mask": attention_mask.cpu().numpy(),
-            "i_kv_cache": np.zeros([2, 2, 32, 0, 80]).astype(np.float32),
+            "i_attn_mask": np.ones([batch_size, seq_len]).astype(np.int32),
+            "i_kv_cache": np.zeros([2, batch_size, 32, 0, 80]).astype(np.float32),
         }
 
         ort_outs = self.ort_session.run(None, ort_inputs)
@@ -234,7 +235,7 @@ batch_size = 2
 seq_len = 8
 
 kv_mem_dict = {}
-kv_mem_dict[0] = torch.zeros([batch_size, 2048, 2, config.n_head, 80]).cuda()
+kv_mem_dict[0] = torch.zeros([batch_size, 2048, 2, config.n_head, 80])
 inference_params = InferenceParams(
     max_seqlen=config.n_positions,
     max_batch_size=batch_size,
@@ -244,8 +245,8 @@ inference_params = InferenceParams(
     lengths_per_sample=None,
 )
 
-hidden_states = torch.ones([batch_size, seq_len, config.n_embd]).cuda()
-attention_mask = torch.ones([batch_size, seq_len]).cuda()
+hidden_states = torch.ones([batch_size, seq_len, config.n_embd])
+attention_mask = torch.ones([batch_size, seq_len])
 
 torch_out = block(
     hidden_states,
