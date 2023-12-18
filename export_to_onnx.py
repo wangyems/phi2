@@ -76,7 +76,7 @@ torch.set_default_device("cuda")
 config = MixFormerSequentialConfig.from_json_file("model/config.json")
 tokenizer = CodeGenTokenizer.from_pretrained("tokenizer")
 model = MyPhi2(config)
-#model.load_state_dict(torch.load("model/pytorch_model.bin"))
+model.load_state_dict(torch.load("model/pytorch_model.bin"))
 model.eval()
 
 # inputs = tokenizer('''```python
@@ -89,9 +89,9 @@ model.eval()
 # text = tokenizer.batch_decode(outputs)[0]
 # print(text)
 
-batch_size, sequence_length, past_sequence_length = 2, 4096, 0
+batch_size, sequence_length, past_sequence_length = 2, 8, 0
 
-max_sequence_length = 2048
+max_sequence_length = 512
 
 # Export decoder_merged_model.onnx
 decoder_merged_inputs = get_merged_sample_with_past_kv_inputs(
@@ -110,33 +110,38 @@ decoder_out = model(decoder_merged_inputs[0], decoder_merged_inputs[1], decoder_
 
 
 # ort run
-if False:
+if True:
     from onnxruntime import InferenceSession, SessionOptions
     import numpy as np
     sess_options = SessionOptions()
-    model_path = "/wy/onnx_models/phi2/mlflow_model_folder/data/phi-2_decoder_small_opt.onnx"
+    model_path = "/wy/onnx_models/phi2/mlflow_model_folder/data/phi-2_decoder_fp32_opt.onnx"
+    #model_path = "/yufeng_data/models/phi2/mlflow_model_folder/data/onnx_models/phi-2_decoder.onnx"
+    #model_path = "/wy/onnx_models/phi2/mlflow_model_folder/data/phi-2_decoder_fp16_opt.onnx"
     ort_session = InferenceSession(model_path, sess_options, providers=["CUDAExecutionProvider"])
     # convert decoder_merged_inputs to ort_inputs
     ort_inputs = {}
     for i, name in enumerate(ort_session.get_inputs()):
         if i == 0:
-            ort_inputs[name.name] = decoder_merged_inputs[i].cpu().numpy()
+            ort_inputs[name.name] = decoder_merged_inputs[i].cpu().numpy().astype(np.int32)
             print(ort_inputs[name.name].shape)
         elif i == 1:
-            ort_inputs[name.name] = np.ones([2, 2048]).astype(np.int64)
+            ort_inputs[name.name] = np.ones([2, 8]).astype(np.int32)
             print(ort_inputs[name.name].shape)
         else:
-            ort_inputs[name.name] = np.transpose(decoder_merged_inputs[2][i - 2].detach().cpu().numpy(), (2, 0, 3, 1, 4))
+            #ort_inputs[name.name] = np.transpose(decoder_merged_inputs[2][i - 2].detach().cpu().numpy(), (2, 0, 3, 1, 4))
+            ort_inputs[name.name] = np.zeros([2, 2, 32, 0, 80]).astype(np.float32)
             print(ort_inputs[name.name].shape)
     ort_outs = ort_session.run(None, ort_inputs)
+    print(decoder_out[0].detach().cpu().numpy())
+    print(ort_outs[0])
 
-use_dynamo = True
-
-if True:
+if False:
+    use_dynamo = True
     if use_dynamo:
         from torch._dynamo import config
         config.capture_scalar_outputs = True
-        temp_path = "phi-2_decoder_small.onnx"
+        temp_path = "phi-2_decoder_fp32.onnx"
+        #temp_path = "phi-2_decoder_small.onnx"
         torch.onnx.dynamo_export(
             model, decoder_merged_inputs[0], decoder_merged_inputs[1], decoder_merged_inputs[2], export_options=torch.onnx.ExportOptions(dynamic_shapes=True)
         ).save(temp_path)
