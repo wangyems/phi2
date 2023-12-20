@@ -10,6 +10,7 @@ import os
 
 input_ids_name = "input_ids"
 attention_mask_name = "attention_mask"
+past_seq_len_name = "past_sequence_length"
 
 logits_name = "logits"
 
@@ -21,15 +22,17 @@ def get_initial_inputs_and_outputs(tokenizer: CodeGenTokenizer, prompt: List[str
 
     input_ids = torch.tensor(encodings_dict["input_ids"], device=device, dtype=torch.int32)
     attention_mask = torch.tensor(encodings_dict["attention_mask"], device=device, dtype=torch.int32)
+    past_seq_len = torch.tensor(0, device=torch.device("cpu"), dtype=torch.int32)
 
     inputs = {
         input_ids_name: input_ids.contiguous(),
         attention_mask_name: attention_mask.contiguous(),
+        past_seq_len_name: past_seq_len.contiguous()
     }
 
     batch_size, sequence_length = input_ids.shape
 
-    max_sequence_length = 2048
+    max_sequence_length = 128
     num_heads, head_size = 32, 80
     for i in range(32):
         past_key_value = torch.zeros(2, batch_size, num_heads, max_sequence_length if use_buffer_share else 0, head_size, device=device, dtype=torch_dtype)
@@ -86,7 +89,7 @@ def apply_io_binding(model: ort.InferenceSession, inputs: dict, outputs: dict, u
         name = output.name
         if use_buffer_share and "present" in name:
             # Bind KV cache outputs to KV cache inputs
-            v = inputs[name.replace("present", "past_key_values")]
+            v = inputs[name.replace("present", "past")]
             io_binding.bind_output(
                 name=name,
                 device_type=v.device.type,
@@ -110,18 +113,16 @@ def apply_io_binding(model: ort.InferenceSession, inputs: dict, outputs: dict, u
 
 def main():
     # User settings
-    # python -m onnxruntime.quantization.matmul_4bits_quantizer --input_model phi-2_decoder_fp32_opt.onnx --output_model int4.onnx --symmetric True --block_size 16
-    onnx_model_path, use_fp16, use_buffer_share = "/wy/onnx_models/phi2/mlflow_model_folder/data/phi-2_decoder_fp32_opt.onnx", False, False
+    onnx_model_path, use_fp16, use_buffer_share = "/wy/onnx_models/phi2/mlflow_model_folder/data/phi-2_decoder_fp16_opt.onnx", True, True
 
     prompt, max_length = ['''```python
     def print_prime(n):
     """
     Print all primes between 1 and n
-    """''', "use OnnxRuntime to run model on device"], 64
-
+    """''', "use OnnxRuntime to run model on device"], 128
 
     # Get information based on user settings
-    device_id = 6
+    device_id = 5
     device = torch.device(f"cuda:{device_id}")
     torch_dtype = torch.float16 if use_fp16 else torch.float32
     base_path = "/wy/onnx_models/phi2/mlflow_model_folder/data/"
@@ -134,7 +135,7 @@ def main():
     # sess_options.log_verbosity_level = 1
     # sess_options.log_severity_level = 1
     print("creating session")
-    ep = ("CUDAExecutionProvider", {"device_id": device_id}) if device.type == "cuda" else "CPUExecutionProvider"
+    ep = ("CUDAExecutionProvider", {"device_id": device_id, "enable_skip_layer_norm_strict_mode": True}) if device.type == "cuda" else "CPUExecutionProvider"
     model = ort.InferenceSession(onnx_model_path, sess_options=sess_options, providers=[ep])
     print("done")
 
@@ -175,9 +176,10 @@ def main():
             break
 
         # Update inputs for next inference run
-        current_length += 1
+        inputs["past_sequence_length"] = torch.tensor(current_length, device=torch.device("cpu"), dtype=torch.int32)
         inputs["input_ids"] = tokens_to_add.to(torch.int32)
         inputs["attention_mask"] = torch.cat([inputs["attention_mask"], (~has_eos).to(torch.int32).reshape(batch_size, 1)], 1)
+        current_length += 1
 
         # Set logits to zeros for next inference run and re-use memory buffer
         if outputs[logits_name].shape[1] != 1:
