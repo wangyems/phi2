@@ -111,13 +111,13 @@ def apply_io_binding(model: ort.InferenceSession, inputs: dict, outputs: dict, u
 def main():
     # User settings
     # python -m onnxruntime.quantization.matmul_4bits_quantizer --input_model phi-2_decoder_fp32_opt.onnx --output_model int4.onnx --symmetric True --block_size 16
-    onnx_model_path, use_fp16, use_buffer_share = "/wy/onnx_models/phi2/mlflow_model_folder/data/phi-2_decoder_fp32_opt.onnx", False, False
+    onnx_model_path, use_fp16, use_buffer_share = "/wy/onnx_models/phi2/mlflow_model_folder/data/phi-2_fp16_int4_inlined.onnx", True, False
 
     prompt, max_length = ['''```python
     def print_prime(n):
     """
     Print all primes between 1 and n
-    """''', "use OnnxRuntime to run model on device"], 64
+    """''', "use OnnxRuntime to run model on device"], 128
 
 
     # Get information based on user settings

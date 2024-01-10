@@ -151,7 +151,7 @@ def apply_io_binding(model: ort.InferenceSession, inputs: dict, outputs: dict, u
 
 def main():
     # User settings
-    onnx_model_path, use_fp16, use_buffer_share = "/wy/onnx_models/phi2/mlflow_model_folder/data/phi-2_fp16_int4.onnx", True, False
+    onnx_model_path, use_fp16, use_buffer_share = "/wy/onnx_models/phi2/mlflow_model_folder/data/phi-2_decoder_fp16_opt.onnx", True, False
 
     prompt, max_length = ['''```python
     def print_prime(n):
@@ -176,8 +176,12 @@ def main():
     print("done")
 
     for token_num in [32, 128]:
-        for batch_size in [2]:
+        for batch_size in [1, 4, 8, 16]:
             for seq_len in [64, 128, 256, 512, 1024, 2048, 4096]:
+                if batch_size == 8 and seq_len == 4096:
+                    continue
+                if batch_size == 16 and seq_len >= 2048:
+                    continue
                 max_length = seq_len + token_num
                 print("batch size:", batch_size, "seq len:", seq_len, "token_num:", token_num)
                 # Get model and its initial inputs/outputs
@@ -222,7 +226,7 @@ def main():
                         final_fence = time.time()
                         print(f"Time for prompt: {1000 * (prompt_fence - start)}ms", f"Time for token: {1000 * (final_fence - prompt_fence) / count}ms")
                         break
-                    
+
                     # Update inputs for next inference run
                     #inputs["past_sequence_length"] = torch.tensor(current_length, device=torch.device("cpu"), dtype=torch.int32)
                     inputs["input_ids"] = tokens_to_add.to(torch.int32)
@@ -234,7 +238,7 @@ def main():
                         final_fence = time.time()
                         print(f"Time for prompt: {1000 * (prompt_fence - start)}ms", f"Time for token: {1000 * (final_fence - prompt_fence) / count}ms")
                         break
-                    
+
                     # Set logits to zeros for next inference run and re-use memory buffer
                     if outputs[logits_name].shape[1] != 1:
                         outputs[logits_name] = outputs[logits_name][:, :1, :].contiguous()

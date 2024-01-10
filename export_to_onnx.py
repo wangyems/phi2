@@ -124,7 +124,7 @@ if False:
     from onnxruntime import InferenceSession, SessionOptions
     import numpy as np
     sess_options = SessionOptions()
-    model_path = "/wy/onnx_models/phi2/mlflow_model_folder/data/phi-2_decoder_fp16_opt.onnx"
+    model_path = "/wy/onnx_models/phi2/mlflow_model_folder/data/phi-2_decoder_fp32_opt.onnx"
     #model_path = "/yufeng_data/models/phi2/mlflow_model_folder/data/onnx_models/phi-2_decoder.onnx"
     #model_path = "/wy/onnx_models/phi2/mlflow_model_folder/data/phi-2_decoder_fp16_opt.onnx"
     ep = ("CUDAExecutionProvider")
@@ -152,7 +152,7 @@ if False:
     #print(ort_outs[0] - decoder_out[0].detach().cpu().numpy())
     #print(np.allclose(decoder_out[0].detach().cpu().numpy(), ort_outs[0], atol=1e-2))
 
-if True:
+if False:
     use_dynamo = True
     if use_dynamo:
         from torch._dynamo import config
