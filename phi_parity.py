@@ -19,7 +19,7 @@ from model.modeling_mixformer_sequential import InferenceParams, MHA, MLP
 
 torch.manual_seed(0)
 
-attn_choice = "gqa_bf16" # choose from attn, mha, gqa_fp16, gqa_bf16
+attn_choice = "mha" # choose from attn, mha, gqa_fp16, gqa_bf16
 # attn is all good, mha needs to comment rotary and causal, gqa need to comment rotary
 
 def create_block_graph_attn(
@@ -212,8 +212,8 @@ def create_block_graph_mha(
             outputs=[ "attn_out", "present_key", "present_value"],
             name= "MultiHeadAttention_0",
             domain="com.microsoft",
-            num_heads=32, 
-            # Need to support causal attention if using this op in cpu
+            num_heads=32,
+            unidirectional=1,
         ),
         helper.make_node(
             "MatMul",
@@ -408,7 +408,7 @@ def create_block_graph_gqa(
             outputs=[ "attn_out", "present_key_fp16", "present_value_fp16"],
             name= "GroupQueryAttention_0",
             domain="com.microsoft",
-            num_heads=32, 
+            num_heads=32,
             kv_num_heads=32,
         ),
         helper.make_node(
@@ -608,10 +608,11 @@ class ParallelBlock(nn.Module):
                 self.mlp.fc1.bias.to(torch_type),
                 self.mlp.fc2.weight.transpose(0, 1).to(torch_type),
                 self.mlp.fc2.bias.to(torch_type),
-            ) 
+            )
 
         sess_options = onnxruntime.SessionOptions()
-        self.ort_session = onnxruntime.InferenceSession(self.onnx_graph, sess_options, providers=["CUDAExecutionProvider"])
+        providers = ["CPUExecutionProvider"] if attn_choice == "mha" else ["CUDAExecutionProvider"]
+        self.ort_session = onnxruntime.InferenceSession(self.onnx_graph, sess_options, providers=providers)
 
 
     def forward(
