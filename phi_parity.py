@@ -19,7 +19,7 @@ from model.modeling_mixformer_sequential import InferenceParams, MHA, MLP
 
 torch.manual_seed(0)
 
-attn_choice = "gqa" # choose from attn, mha, gqa
+attn_choice = "gqa_bf16" # choose from attn, mha, gqa_fp16, gqa_bf16
 # attn is all good, mha needs to comment rotary and causal, gqa need to comment rotary
 
 def create_block_graph_attn(
@@ -328,11 +328,18 @@ def create_block_graph_gqa(
     mlp_fc2_bias_t,
 ):
     hidden_size = num_heads * head_size
-
+    tensor_type = TensorProto.FLOAT16 if attn_choice == "gqa_fp16" else TensorProto.BFLOAT16
     subgraph_nodes = [
         helper.make_node(
+            "Cast",
+            inputs=["i_hidden_states"],
+            outputs=["i_hidden_states_cast"],
+            name= "Cast_0",
+            to=tensor_type,
+        ),
+        helper.make_node(
             "LayerNormalization",
-            inputs=["i_hidden_states", "ln_weight", "ln_bias"],
+            inputs=["i_hidden_states_cast", "ln_weight", "ln_bias"],
             outputs=["ln_out"],
             name= "LayerNormalization",
             epsilon=9.999999747378752e-06,
@@ -374,21 +381,49 @@ def create_block_graph_gqa(
             name= "V_Bias",
         ),
         helper.make_node(
+            "Cast",
+            inputs=["past_key"],
+            outputs=["past_key_cast"],
+            name= "Cast_1",
+            to=tensor_type,
+        ),
+        helper.make_node(
+            "Cast",
+            inputs=["past_value"],
+            outputs=["past_value_cast"],
+            name= "Cast_2",
+            to=tensor_type,
+        ),
+        helper.make_node(
             "GroupQueryAttention",
             inputs=[
                 "query",
                 "key",
                 "value",
-                "past_key",
-                "past_value",
+                "past_key_cast",
+                "past_value_cast",
                 "seqlens_k",
                 "total_sequence_length",
             ],
-            outputs=[ "attn_out", "present_key", "present_value"],
+            outputs=[ "attn_out", "present_key_fp16", "present_value_fp16"],
             name= "GroupQueryAttention_0",
             domain="com.microsoft",
             num_heads=32, 
             kv_num_heads=32,
+        ),
+        helper.make_node(
+            "Cast",
+            inputs=["present_key_fp16"],
+            outputs=["present_key"],
+            name= "Cast_3",
+            to=TensorProto.FLOAT,
+        ),
+        helper.make_node(
+            "Cast",
+            inputs=["present_value_fp16"],
+            outputs=["present_value"],
+            name= "Cast_4",
+            to=TensorProto.FLOAT,
         ),
         helper.make_node(
             "MatMul",
@@ -441,13 +476,18 @@ def create_block_graph_gqa(
         ),
         helper.make_node(
             "Add",
-            inputs=["i_hidden_states", "residual_1_out"],
-            outputs=["o_hidden_states"],
+            inputs=["i_hidden_states_cast", "residual_1_out"],
+            outputs=["o_hidden_states_fp16"],
             name= "Residual_Add_2",
         ),
+        helper.make_node(
+            "Cast",
+            inputs=["o_hidden_states_fp16"],
+            outputs=["o_hidden_states"],
+            name= "Cast_5",
+            to=TensorProto.FLOAT,
+        ),
     ]
-
-    tensor_type = TensorProto.FLOAT16
     initializers = [
         helper.make_tensor("ln_weight", tensor_type, [hidden_size], ln_weight_t.flatten().tolist()),
         helper.make_tensor("ln_bias", tensor_type, [hidden_size], ln_bias_t.flatten().tolist()),
@@ -465,24 +505,30 @@ def create_block_graph_gqa(
         helper.make_tensor("mlp_fc2_bias", tensor_type, [hidden_size], mlp_fc2_bias_t.flatten().tolist()),
     ]
 
+    value_info = [
+        helper.make_tensor_value_info("past_key_cast", tensor_type, ['batch_size', num_heads, 'past_seq_len', head_size]),
+        helper.make_tensor_value_info("past_value_cast", tensor_type, ['batch_size', num_heads, 'past_seq_len', head_size]),
+        helper.make_tensor_value_info("present_key_fp16", tensor_type, ['batch_size', num_heads, 'total_seq_len', head_size]),
+        helper.make_tensor_value_info("present_value_fp16", tensor_type, ['batch_size', num_heads, 'total_seq_len', head_size]),
+    ]
+
     graph = helper.make_graph(
         subgraph_nodes,
         "Block_Graph",
         [
-            helper.make_tensor_value_info("i_hidden_states", tensor_type, ['batch_size', 'seq_len', hidden_size]),
+            helper.make_tensor_value_info("i_hidden_states", TensorProto.FLOAT, ['batch_size', 'seq_len', hidden_size]),
             helper.make_tensor_value_info("seqlens_k", TensorProto.INT32, ['batch_size']),
             helper.make_tensor_value_info("total_sequence_length", TensorProto.INT32, []),
-            helper.make_tensor_value_info("past_key", tensor_type, ['batch_size', num_heads, 'past_seq_len', head_size]),
-            helper.make_tensor_value_info("past_value", tensor_type, ['batch_size', num_heads, 'past_seq_len', head_size]),
+            helper.make_tensor_value_info("past_key", TensorProto.FLOAT, ['batch_size', num_heads, 'past_seq_len', head_size]),
+            helper.make_tensor_value_info("past_value", TensorProto.FLOAT, ['batch_size', num_heads, 'past_seq_len', head_size]),
         ],
         [
-            helper.make_tensor_value_info("o_hidden_states", tensor_type, ['batch_size', 'seq_len', hidden_size]),
-            helper.make_tensor_value_info("present_key", tensor_type, ['batch_size', num_heads, 'total_seq_len', head_size]),
-            helper.make_tensor_value_info("present_value", tensor_type, ['batch_size', num_heads, 'total_seq_len', head_size]),
-            helper.make_tensor_value_info("ln_out", tensor_type, ['batch_size', 'seq_len', hidden_size]),
-            helper.make_tensor_value_info("attn_out", tensor_type, ['batch_size', 'seq_len', hidden_size]),
+            helper.make_tensor_value_info("o_hidden_states", TensorProto.FLOAT, ['batch_size', 'seq_len', hidden_size]),
+            helper.make_tensor_value_info("present_key", TensorProto.FLOAT, ['batch_size', num_heads, 'total_seq_len', head_size]),
+            helper.make_tensor_value_info("present_value", TensorProto.FLOAT, ['batch_size', num_heads, 'total_seq_len', head_size]),
         ],
         initializers,
+        value_info=value_info,
     )
 
     model = helper.make_model(graph)
@@ -543,24 +589,25 @@ class ParallelBlock(nn.Module):
                 self.mlp.fc2.weight.transpose(0, 1),
                 self.mlp.fc2.bias,
             )
-        elif attn_choice == "gqa":
+        elif attn_choice == "gqa_fp16" or attn_choice == "gqa_bf16":
+            torch_type = torch.float16 if attn_choice == "gqa_fp16" else torch.bfloat16
             self.onnx_graph = create_block_graph_gqa(
                 config.n_head,
                 80, # head_size
-                self.ln.weight.to(torch.float16),
-                self.ln.bias.to(torch.float16),
-                torch.split(self.mixer.Wqkv.weight, 2560)[0].transpose(0, 1).to(torch.float16),
-                torch.split(self.mixer.Wqkv.weight, 2560)[1].transpose(0, 1).to(torch.float16),
-                torch.split(self.mixer.Wqkv.weight, 2560)[2].transpose(0, 1).to(torch.float16),
-                torch.split(self.mixer.Wqkv.bias, 2560)[0].to(torch.float16),
-                torch.split(self.mixer.Wqkv.bias, 2560)[1].to(torch.float16),
-                torch.split(self.mixer.Wqkv.bias, 2560)[2].to(torch.float16),
-                self.mixer.out_proj.weight.transpose(0, 1).to(torch.float16),
-                self.mixer.out_proj.bias.to(torch.float16),
-                self.mlp.fc1.weight.transpose(0, 1).to(torch.float16),
-                self.mlp.fc1.bias.to(torch.float16),
-                self.mlp.fc2.weight.transpose(0, 1).to(torch.float16),
-                self.mlp.fc2.bias.to(torch.float16),
+                self.ln.weight.to(torch_type),
+                self.ln.bias.to(torch_type),
+                torch.split(self.mixer.Wqkv.weight, 2560)[0].transpose(0, 1).to(torch_type),
+                torch.split(self.mixer.Wqkv.weight, 2560)[1].transpose(0, 1).to(torch_type),
+                torch.split(self.mixer.Wqkv.weight, 2560)[2].transpose(0, 1).to(torch_type),
+                torch.split(self.mixer.Wqkv.bias, 2560)[0].to(torch_type),
+                torch.split(self.mixer.Wqkv.bias, 2560)[1].to(torch_type),
+                torch.split(self.mixer.Wqkv.bias, 2560)[2].to(torch_type),
+                self.mixer.out_proj.weight.transpose(0, 1).to(torch_type),
+                self.mixer.out_proj.bias.to(torch_type),
+                self.mlp.fc1.weight.transpose(0, 1).to(torch_type),
+                self.mlp.fc1.bias.to(torch_type),
+                self.mlp.fc2.weight.transpose(0, 1).to(torch_type),
+                self.mlp.fc2.bias.to(torch_type),
             ) 
 
         sess_options = onnxruntime.SessionOptions()
@@ -607,13 +654,13 @@ class ParallelBlock(nn.Module):
                 "past_key": np.zeros([batch_size, 32, 0, 80]).astype(np.float32),
                 "past_value": np.zeros([batch_size, 32, 0, 80]).astype(np.float32),
             }
-        elif attn_choice == "gqa":
+        elif attn_choice == "gqa_fp16" or attn_choice == "gqa_bf16":
             ort_inputs = {
-                "i_hidden_states": hidden_states.cpu().numpy().astype(np.float16),
+                "i_hidden_states": hidden_states.cpu().numpy(),
                 "seqlens_k": seq_len * np.ones([batch_size]).astype(np.int32),
                 "total_sequence_length": np.array(seq_len).astype(np.int32),
-                "past_key": np.zeros([batch_size, 32, 0, 80]).astype(np.float16),
-                "past_value": np.zeros([batch_size, 32, 0, 80]).astype(np.float16),
+                "past_key": np.zeros([batch_size, 32, 0, 80]).astype(np.float32),
+                "past_value": np.zeros([batch_size, 32, 0, 80]).astype(np.float32),
             }
 
         ort_outs = self.ort_session.run(None, ort_inputs)
@@ -626,8 +673,8 @@ config = MixFormerSequentialConfig.from_json_file("model/config.json")
 block = ParallelBlock(config, block_idx=0)
 block.eval()
 
-batch_size = 1
-seq_len = 8
+batch_size = 2
+seq_len = 32
 
 kv_mem_dict = {}
 kv_mem_dict[0] = torch.zeros([batch_size, 128, 2, config.n_head, 80])
@@ -659,4 +706,5 @@ print("torch: output:", torch_out)
 # print("ort: ln_out", torch.tensor(ort_out[2]))
 # print("ort: attn_out", torch.tensor(ort_out[3]))
 print("ort: output", torch.tensor(ort_out[0]))
-print("parity:", torch.allclose(torch_out, torch.tensor(ort_out[0]).to(torch.float), atol=3e-3))
+print("parity:", torch.allclose(torch_out, torch.tensor(ort_out[0]).to(torch.float), atol=3e-2))
+print("max diff:", torch.max(torch.abs(torch_out - torch.tensor(ort_out[0]).to(torch.float))))
