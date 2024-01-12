@@ -19,8 +19,12 @@ from model.modeling_mixformer_sequential import InferenceParams, MHA, MLP
 
 torch.manual_seed(0)
 
+batch_size = 2
+seq_len = 32
+config_n_head = 32
+
 attn_choice = "mha" # choose from attn, mha, gqa_fp16, gqa_bf16
-# attn is all good, mha needs to comment rotary and causal, gqa need to comment rotary
+# attn is all good, mha needs to comment rotary, gqa need to comment rotary
 
 def create_block_graph_attn(
     num_heads,
@@ -58,7 +62,7 @@ def create_block_graph_attn(
             outputs=[ "attn_out", "o_kv_cache"],
             name= "Attention",
             domain="com.microsoft",
-            num_heads=32,
+            num_heads=num_heads,
             unidirectional=1,
             do_rotary=1,
             rotary_embedding_dim=32,
@@ -161,13 +165,17 @@ def create_block_graph_mha(
     attn_q_weight_t,
     attn_k_weight_t,
     attn_v_weight_t,
-    attn_qkv_bias_t,
+    attn_q_bias_t,
+    attn_k_bias_t,
+    attn_v_bias_t,
     attn_out_weight_t,
     attn_out_bias_t,
     mlp_fc1_weight_t,
     mlp_fc1_bias_t,
     mlp_fc2_weight_t,
     mlp_fc2_bias_t,
+    cos_cache_t,
+    sin_cache_t,
 ):
     hidden_size = num_heads * head_size
 
@@ -182,28 +190,64 @@ def create_block_graph_mha(
         helper.make_node(
             "MatMul",
             inputs=[ "ln_out", "attn_q_weight"],
-            outputs=[ "query"],
+            outputs=[ "q_matmul_out"],
             name= "Q_MatMul",
+        ),
+        helper.make_node(
+            "Add",
+            inputs=[ "q_matmul_out", "attn_q_bias"],
+            outputs=[ "query"],
+            name= "Q_Bias",
         ),
         helper.make_node(
             "MatMul",
             inputs=[ "ln_out", "attn_k_weight"],
-            outputs=[ "key"],
+            outputs=[ "k_matmul_out"],
             name= "K_MatMul",
+        ),
+        helper.make_node(
+            "Add",
+            inputs=[ "k_matmul_out", "attn_k_bias"],
+            outputs=[ "key"],
+            name= "K_Bias",
+        ),
+        helper.make_node(
+            "RotaryEmbedding",
+            inputs=["query", "step", "cos_cache", "sin_cache"],
+            outputs=["query_rot"],
+            name= "RotaryEmbedding_Q",
+            domain="com.microsoft",
+            rotary_embedding_dim=32,
+            num_heads=num_heads,
+        ),
+        helper.make_node(
+            "RotaryEmbedding",
+            inputs=["key", "step", "cos_cache", "sin_cache"],
+            outputs=["key_rot"],
+            name= "RotaryEmbedding_K",
+            domain="com.microsoft",
+            rotary_embedding_dim=32,
+            num_heads=num_heads,
         ),
         helper.make_node(
             "MatMul",
             inputs=[ "ln_out", "attn_v_weight"],
-            outputs=[ "value"],
+            outputs=[ "v_matmul_out"],
             name= "V_MatMul",
+        ),
+        helper.make_node(
+            "Add",
+            inputs=[ "v_matmul_out", "attn_v_bias"],
+            outputs=[ "value"],
+            name= "V_Bias",
         ),
         helper.make_node(
             "MultiHeadAttention",
             inputs=[
-                "query",
-                "key",
+                "query_rot",
+                "key_rot",
                 "value",
-                "attn_qkv_bias",
+                "",
                 "i_attn_mask",
                 "",
                 "past_key",
@@ -212,7 +256,7 @@ def create_block_graph_mha(
             outputs=[ "attn_out", "present_key", "present_value"],
             name= "MultiHeadAttention_0",
             domain="com.microsoft",
-            num_heads=32,
+            num_heads=num_heads,
             unidirectional=1,
         ),
         helper.make_node(
@@ -278,7 +322,11 @@ def create_block_graph_mha(
         helper.make_tensor("attn_q_weight", TensorProto.FLOAT, [hidden_size, hidden_size], attn_q_weight_t.flatten().tolist()),
         helper.make_tensor("attn_k_weight", TensorProto.FLOAT, [hidden_size, hidden_size], attn_k_weight_t.flatten().tolist()),
         helper.make_tensor("attn_v_weight", TensorProto.FLOAT, [hidden_size, hidden_size], attn_v_weight_t.flatten().tolist()),
-        helper.make_tensor("attn_qkv_bias", TensorProto.FLOAT, [hidden_size * 3], attn_qkv_bias_t.flatten().tolist()),
+        helper.make_tensor("cos_cache", TensorProto.FLOAT, [seq_len, 16], cos_cache_t.flatten().tolist()),
+        helper.make_tensor("sin_cache", TensorProto.FLOAT, [seq_len, 16], sin_cache_t.flatten().tolist()),
+        helper.make_tensor("attn_q_bias", TensorProto.FLOAT, [hidden_size], attn_q_bias_t.flatten().tolist()),
+        helper.make_tensor("attn_k_bias", TensorProto.FLOAT, [hidden_size], attn_k_bias_t.flatten().tolist()),
+        helper.make_tensor("attn_v_bias", TensorProto.FLOAT, [hidden_size], attn_v_bias_t.flatten().tolist()),
         helper.make_tensor("attn_out_weight", TensorProto.FLOAT, [hidden_size, hidden_size], attn_out_weight_t.flatten().tolist()),
         helper.make_tensor("attn_out_bias", TensorProto.FLOAT, [hidden_size], attn_out_bias_t.flatten().tolist()),
         helper.make_tensor("mlp_fc1_weight", TensorProto.FLOAT, [hidden_size, hidden_size * 4], mlp_fc1_weight_t.flatten().tolist()),
@@ -293,6 +341,7 @@ def create_block_graph_mha(
         [
             helper.make_tensor_value_info("i_hidden_states", TensorProto.FLOAT, ['batch_size', 'seq_len', hidden_size]),
             helper.make_tensor_value_info("i_attn_mask", TensorProto.INT32, ['batch_size', 'seq_len']),
+            helper.make_tensor_value_info("step", TensorProto.INT64, [1]),
             helper.make_tensor_value_info("past_key", TensorProto.FLOAT, ['batch_size', num_heads, 'past_seq_len', head_size]),
             helper.make_tensor_value_info("past_value", TensorProto.FLOAT, ['batch_size', num_heads, 'past_seq_len', head_size]),
         ],
@@ -408,8 +457,8 @@ def create_block_graph_gqa(
             outputs=[ "attn_out", "present_key_fp16", "present_value_fp16"],
             name= "GroupQueryAttention_0",
             domain="com.microsoft",
-            num_heads=32,
-            kv_num_heads=32,
+            num_heads=num_heads,
+            kv_num_heads=num_heads,
         ),
         helper.make_node(
             "Cast",
@@ -554,15 +603,19 @@ class ParallelBlock(nn.Module):
 
         self.mixer = MHA(config, layer_idx=block_idx)
         self.mlp = MLP(config)
+        self.rotary_emb = self.mixer.rotary_emb
+        self.rotary_emb._update_cos_sin_cache(seq_len)
+        cos_cache = self.rotary_emb._cos_cached
+        sin_cache = self.rotary_emb._sin_cached
 
         if attn_choice == "attn":
             self.onnx_graph = create_block_graph_attn(
-                config.n_head,
+                config_n_head,
                 80, # head_size
                 self.ln.weight,
                 self.ln.bias,
-                #self.mixer.Wqkv.weight.reshape(config.n_head, 3, -1).transpose(0, 1).reshape(3 * config.n_embd, -1).transpose(0, 1),
-                #self.mixer.Wqkv.bias.reshape(config.n_head, 3, -1).transpose(0, 1).reshape(-1),
+                #self.mixer.Wqkv.weight.reshape(config_n_head, 3, -1).transpose(0, 1).reshape(3 * config.n_embd, -1).transpose(0, 1),
+                #self.mixer.Wqkv.bias.reshape(config_n_head, 3, -1).transpose(0, 1).reshape(-1),
                 self.mixer.Wqkv.weight.transpose(0, 1),
                 self.mixer.Wqkv.bias,
                 self.mixer.out_proj.weight.transpose(0, 1),
@@ -574,25 +627,29 @@ class ParallelBlock(nn.Module):
             )
         elif attn_choice == "mha":
             self.onnx_graph = create_block_graph_mha(
-                config.n_head,
+                config_n_head,
                 80, # head_size
                 self.ln.weight,
                 self.ln.bias,
                 torch.split(self.mixer.Wqkv.weight, 2560)[0].transpose(0, 1),
                 torch.split(self.mixer.Wqkv.weight, 2560)[1].transpose(0, 1),
                 torch.split(self.mixer.Wqkv.weight, 2560)[2].transpose(0, 1),
-                self.mixer.Wqkv.bias,
+                torch.split(self.mixer.Wqkv.bias, 2560)[0],
+                torch.split(self.mixer.Wqkv.bias, 2560)[1],
+                torch.split(self.mixer.Wqkv.bias, 2560)[2],
                 self.mixer.out_proj.weight.transpose(0, 1),
                 self.mixer.out_proj.bias,
                 self.mlp.fc1.weight.transpose(0, 1),
                 self.mlp.fc1.bias,
                 self.mlp.fc2.weight.transpose(0, 1),
                 self.mlp.fc2.bias,
+                cos_cache,
+                sin_cache,
             )
         elif attn_choice == "gqa_fp16" or attn_choice == "gqa_bf16":
             torch_type = torch.float16 if attn_choice == "gqa_fp16" else torch.bfloat16
             self.onnx_graph = create_block_graph_gqa(
-                config.n_head,
+                config_n_head,
                 80, # head_size
                 self.ln.weight.to(torch_type),
                 self.ln.bias.to(torch_type),
@@ -646,22 +703,23 @@ class ParallelBlock(nn.Module):
             ort_inputs = {
                 "i_hidden_states": hidden_states.cpu().numpy(),
                 "i_attn_mask": np.ones([batch_size, seq_len]).astype(np.int32),
-                "i_kv_cache": np.zeros([2, batch_size, 32, 0, 80]).astype(np.float32),
+                "i_kv_cache": np.zeros([2, batch_size, config_n_head, 0, 80]).astype(np.float32),
             }
         elif attn_choice == "mha":
             ort_inputs = {
                 "i_hidden_states": hidden_states.cpu().numpy(),
                 "i_attn_mask": np.ones([batch_size, seq_len]).astype(np.int32),
-                "past_key": np.zeros([batch_size, 32, 0, 80]).astype(np.float32),
-                "past_value": np.zeros([batch_size, 32, 0, 80]).astype(np.float32),
+                "step": np.array([0]).astype(np.int64),
+                "past_key": np.zeros([batch_size, config_n_head, 0, 80]).astype(np.float32),
+                "past_value": np.zeros([batch_size, config_n_head, 0, 80]).astype(np.float32),
             }
         elif attn_choice == "gqa_fp16" or attn_choice == "gqa_bf16":
             ort_inputs = {
                 "i_hidden_states": hidden_states.cpu().numpy(),
                 "seqlens_k": seq_len * np.ones([batch_size]).astype(np.int32),
                 "total_sequence_length": np.array(seq_len).astype(np.int32),
-                "past_key": np.zeros([batch_size, 32, 0, 80]).astype(np.float32),
-                "past_value": np.zeros([batch_size, 32, 0, 80]).astype(np.float32),
+                "past_key": np.zeros([batch_size, config_n_head, 0, 80]).astype(np.float32),
+                "past_value": np.zeros([batch_size, config_n_head, 0, 80]).astype(np.float32),
             }
 
         ort_outs = self.ort_session.run(None, ort_inputs)
@@ -674,13 +732,10 @@ config = MixFormerSequentialConfig.from_json_file("model/config.json")
 block = ParallelBlock(config, block_idx=0)
 block.eval()
 
-batch_size = 2
-seq_len = 32
-
 kv_mem_dict = {}
-kv_mem_dict[0] = torch.zeros([batch_size, 128, 2, config.n_head, 80])
+kv_mem_dict[0] = torch.zeros([batch_size, seq_len, 2, config_n_head, 80])
 inference_params = InferenceParams(
-    max_seqlen=128, #config.n_positions,
+    max_seqlen=seq_len, #config.n_positions,
     max_batch_size=batch_size,
     seqlen_offset=0,
     batch_size_offset=0,
@@ -704,8 +759,6 @@ ort_out = block.ort_forward(
 )
 
 print("torch: output:", torch_out)
-# print("ort: ln_out", torch.tensor(ort_out[2]))
-# print("ort: attn_out", torch.tensor(ort_out[3]))
 print("ort: output", torch.tensor(ort_out[0]))
 print("parity:", torch.allclose(torch_out, torch.tensor(ort_out[0]).to(torch.float), atol=3e-2))
 print("max diff:", torch.max(torch.abs(torch_out - torch.tensor(ort_out[0]).to(torch.float))))
