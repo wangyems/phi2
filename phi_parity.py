@@ -23,8 +23,7 @@ batch_size = 2
 seq_len = 32
 config_n_head = 32
 
-attn_choice = "mha" # choose from attn, mha, gqa_fp16, gqa_bf16
-# attn is all good, mha needs to comment rotary, gqa need to comment rotary
+attn_choice = "gqa_bf16" # choose from attn, mha, gqa_fp16, gqa_bf16
 
 def create_block_graph_attn(
     num_heads,
@@ -375,6 +374,8 @@ def create_block_graph_gqa(
     mlp_fc1_bias_t,
     mlp_fc2_weight_t,
     mlp_fc2_bias_t,
+    cos_cache_t,
+    sin_cache_t,
 ):
     hidden_size = num_heads * head_size
     tensor_type = TensorProto.FLOAT16 if attn_choice == "gqa_fp16" else TensorProto.BFLOAT16
@@ -430,6 +431,24 @@ def create_block_graph_gqa(
             name= "V_Bias",
         ),
         helper.make_node(
+            "RotaryEmbedding",
+            inputs=["query", "step", "cos_cache", "sin_cache"],
+            outputs=["query_rot"],
+            name= "RotaryEmbedding_Q",
+            domain="com.microsoft",
+            rotary_embedding_dim=32,
+            num_heads=num_heads,
+        ),
+        helper.make_node(
+            "RotaryEmbedding",
+            inputs=["key", "step", "cos_cache", "sin_cache"],
+            outputs=["key_rot"],
+            name= "RotaryEmbedding_K",
+            domain="com.microsoft",
+            rotary_embedding_dim=32,
+            num_heads=num_heads,
+        ),
+        helper.make_node(
             "Cast",
             inputs=["past_key"],
             outputs=["past_key_cast"],
@@ -446,8 +465,8 @@ def create_block_graph_gqa(
         helper.make_node(
             "GroupQueryAttention",
             inputs=[
-                "query",
-                "key",
+                "query_rot",
+                "key_rot",
                 "value",
                 "past_key_cast",
                 "past_value_cast",
@@ -546,6 +565,8 @@ def create_block_graph_gqa(
         helper.make_tensor("attn_q_bias", tensor_type, [hidden_size], attn_q_bias_t.flatten().tolist()),
         helper.make_tensor("attn_k_bias", tensor_type, [hidden_size], attn_k_bias_t.flatten().tolist()),
         helper.make_tensor("attn_v_bias", tensor_type, [hidden_size], attn_v_bias_t.flatten().tolist()),
+        helper.make_tensor("cos_cache", tensor_type, [seq_len, 16], cos_cache_t.flatten().tolist()),
+        helper.make_tensor("sin_cache", tensor_type, [seq_len, 16], sin_cache_t.flatten().tolist()),
         helper.make_tensor("attn_out_weight", tensor_type, [hidden_size, hidden_size], attn_out_weight_t.flatten().tolist()),
         helper.make_tensor("attn_out_bias", tensor_type, [hidden_size], attn_out_bias_t.flatten().tolist()),
         helper.make_tensor("mlp_fc1_weight", tensor_type, [hidden_size, hidden_size * 4], mlp_fc1_weight_t.flatten().tolist()),
@@ -568,6 +589,7 @@ def create_block_graph_gqa(
             helper.make_tensor_value_info("i_hidden_states", TensorProto.FLOAT, ['batch_size', 'seq_len', hidden_size]),
             helper.make_tensor_value_info("seqlens_k", TensorProto.INT32, ['batch_size']),
             helper.make_tensor_value_info("total_sequence_length", TensorProto.INT32, []),
+            helper.make_tensor_value_info("step", TensorProto.INT64, [1]),
             helper.make_tensor_value_info("past_key", TensorProto.FLOAT, ['batch_size', num_heads, 'past_seq_len', head_size]),
             helper.make_tensor_value_info("past_value", TensorProto.FLOAT, ['batch_size', num_heads, 'past_seq_len', head_size]),
         ],
@@ -665,6 +687,8 @@ class ParallelBlock(nn.Module):
                 self.mlp.fc1.bias.to(torch_type),
                 self.mlp.fc2.weight.transpose(0, 1).to(torch_type),
                 self.mlp.fc2.bias.to(torch_type),
+                cos_cache.to(torch_type),
+                sin_cache.to(torch_type),
             )
 
         sess_options = onnxruntime.SessionOptions()
@@ -718,6 +742,7 @@ class ParallelBlock(nn.Module):
                 "i_hidden_states": hidden_states.cpu().numpy(),
                 "seqlens_k": seq_len * np.ones([batch_size]).astype(np.int32),
                 "total_sequence_length": np.array(seq_len).astype(np.int32),
+                "step": np.array([0]).astype(np.int64),
                 "past_key": np.zeros([batch_size, config_n_head, 0, 80]).astype(np.float32),
                 "past_value": np.zeros([batch_size, config_n_head, 0, 80]).astype(np.float32),
             }
